@@ -26,6 +26,7 @@
 #include <linux/vmalloc.h>
 #include <asm/arch_timer.h>
 #include <asm/neon.h>
+#include <asm/pgtable-hwdef.h>
 #include <asm/sysreg.h>
 #include <asm/tlbflush.h>
 #include <asm/barrier.h>
@@ -431,6 +432,20 @@ EXPORT_SYMBOL(fki_phys_peek);
 
 /* ---- contiguous memory and the top foreign window ---- */
 
+#if !defined(CONFIG_ARM64_16K_PAGES) || (CONFIG_ARM64_VA_BITS != 48)
+#error "fki.ko requires CONFIG_ARM64_16K_PAGES=y and CONFIG_ARM64_VA_BITS=48"
+#endif
+
+#define FKI_BLOCK_SIZE		PMD_SIZE
+#define FKI_PA_MASK_48		GENMASK_ULL(47, PAGE_SHIFT)
+#define FKI_PGD_INDEX(va)	(((va) >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1))
+
+static_assert(PAGE_SHIFT == 14);
+static_assert(PAGE_SIZE == 16384UL);
+static_assert(CONFIG_PGTABLE_LEVELS == 4);
+static_assert(PGDIR_SHIFT == 47 && PTRS_PER_PGD == 2);
+static_assert(FKI_BLOCK_SIZE == (32UL << 20));
+
 /*
  * The foreign kernel's DRAM, one physically contiguous block of GBs, from the first that works of:
  *  - carve_base/carve_mb: RAM the host kernel does not manage at all (its command line limits it with mem=, the rest is
@@ -450,13 +465,13 @@ static bool resv_used, carve_used;
 
 static void fki_reserve(void)
 {
-	unsigned long cnt = ALIGN(reserve_mb << 20, SZ_2M) >> PAGE_SHIFT;
+	unsigned long cnt = ALIGN(reserve_mb << 20, FKI_BLOCK_SIZE) >> PAGE_SHIFT;
 
 	if (carve_mb)
 		pr_info("fki: %lu MiB at %#lx for the foreign kernel's DRAM (outside the host's memory)\n", carve_mb, carve_base);
 	if (!reserve_mb || fki_resolve() || !p_cma_area || !*p_cma_area || !p_cma_alloc)
 		return;
-	resv_pg = p_cma_alloc(*p_cma_area, cnt, get_order(SZ_2M), true);
+	resv_pg = p_cma_alloc(*p_cma_area, cnt, get_order(FKI_BLOCK_SIZE), true);
 	if (resv_pg)
 		resv_cnt = cnt;
 	pr_info("fki: %lu MiB for the foreign kernel's DRAM %s\n", reserve_mb, resv_pg ? "reserved" : "NOT reserved (CMA)");
@@ -518,8 +533,8 @@ int fki_contig_alloc(unsigned long size, struct fki_region *r)
 
 	if (err)
 		return err;
-	if (carve_mb && !carve_used && ALIGN(size, SZ_2M) <= carve_mb << 20 && !(carve_base & (SZ_2M - 1))) {
-		unsigned long clen = ALIGN(size, SZ_2M);
+	if (carve_mb && !carve_used && ALIGN(size, FKI_BLOCK_SIZE) <= carve_mb << 20 && !(carve_base & (FKI_BLOCK_SIZE - 1))) {
+		unsigned long clen = ALIGN(size, FKI_BLOCK_SIZE);
 		void *va;
 
 		err = fki_carve_check(carve_base, clen);
@@ -537,10 +552,10 @@ int fki_contig_alloc(unsigned long size, struct fki_region *r)
 		}
 		pr_warn("fki: carve-out at %#lx not mappable\n", carve_base);
 	}
-	if (resv_pg && !resv_used && ALIGN(size, SZ_2M) >> PAGE_SHIFT <= resv_cnt) {
+	if (resv_pg && !resv_used && ALIGN(size, FKI_BLOCK_SIZE) >> PAGE_SHIFT <= resv_cnt) {
 		resv_used = true;
 		r->va = page_address(resv_pg);
-		r->size = ALIGN(size, SZ_2M);
+		r->size = ALIGN(size, FKI_BLOCK_SIZE);
 		memset(r->va, 0, r->size);
 		r->pa = page_to_phys(resv_pg);
 		r->handle = (void *)((unsigned long)resv_pg | 2);	/* bit 1: the reservation, kept when freed */
@@ -548,12 +563,12 @@ int fki_contig_alloc(unsigned long size, struct fki_region *r)
 	}
 	/*
 	 * Large blocks (a hosted kernel's DRAM, GBs) come from the CMA area when there is one: a long-running host
-	 * fragments its memory with unmovable pages and alloc_contig_pages then fails. CMA blocks are 2 MiB aligned
-	 * and sized to 2 MiB; a CMA block's handle has bit 0 set.
+	 * fragments its memory with unmovable pages and alloc_contig_pages then fails. CMA blocks are aligned and
+	 * sized to FKI_BLOCK_SIZE (PMD_SIZE, 32 MiB on 16 KiB pages); a CMA block's handle has bit 0 set.
 	 */
 	if (size >= (64UL << 20) && p_cma_area && *p_cma_area && p_cma_alloc && p_cma_release) {
-		unsigned long cnt = ALIGN(size, SZ_2M) >> PAGE_SHIFT;
-		pg = p_cma_alloc(*p_cma_area, cnt, get_order(SZ_2M), true);
+		unsigned long cnt = ALIGN(size, FKI_BLOCK_SIZE) >> PAGE_SHIFT;
+		pg = p_cma_alloc(*p_cma_area, cnt, get_order(FKI_BLOCK_SIZE), true);
 		if (pg) {
 			r->va = page_address(pg);
 			memset(r->va, 0, cnt << PAGE_SHIFT);
@@ -602,12 +617,12 @@ EXPORT_SYMBOL(fki_contig_free);
 int fki_window_l1(unsigned long va, unsigned long long **l1_va, fki_u64 *l1_pa)
 {
 	u64 ttbr1 = read_sysreg(ttbr1_el1) & GENMASK_ULL(47, 1);
-	u64 *l0 = phys_to_virt(ttbr1 & ~0xfffULL);
-	u64 e = READ_ONCE(l0[(va >> 39) & 511]);
+	u64 *l0 = phys_to_virt(ttbr1 & PAGE_MASK);
+	u64 e = READ_ONCE(l0[FKI_PGD_INDEX(va)]);
 
-	if ((e & 3) != 3)
+	if ((e & PGD_TYPE_MASK) != PGD_TYPE_TABLE)
 		return -ENOENT;
-	*l1_pa = e & GENMASK_ULL(47, 12);
+	*l1_pa = e & FKI_PA_MASK_48;
 	*l1_va = phys_to_virt(*l1_pa);
 	return 0;
 }
