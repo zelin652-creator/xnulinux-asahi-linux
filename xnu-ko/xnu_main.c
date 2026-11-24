@@ -63,10 +63,34 @@ module_param(assert_fatal, int, 0444);
 static struct xnu_image img;
 static struct fki_region l2page;
 static unsigned long long *window_slot, *window_l1;
-static unsigned char window_owned[512];
 static u64_t diag_va[6];
-#define XNU_L1_FIRST 384	/* VM_MIN_KERNEL_ADDRESS 0xffffffe000000000 */
-#define XNU_L1_LAST 495	/* VM_MAX_KERNEL_ADDRESS 0xfffffffbffffffff */
+/*
+ * Descriptors installed here are walked with Linux's TCR, so the granule is the host this module was built against.
+ * A 4 KiB host (the LINUX64 bring-up): one L1 slot is 1 GiB, XNU's kernel window is L1[384..495], and stage 210 copies
+ * those entries out of XNU's own 4 KiB L1. A 16 KiB host (Asahi): one L1 slot is 64 GiB and the link address
+ * 0xffffffe000000000 is L1[2046], which the machine leaves empty. XNU stays the 4 KiB LINUX64 kernel (16 KiB VM pages
+ * come from linux64_vm16k, PAGE_RATIO 4). It does not become a __ARM_16K_PG__ / VMAPPLE build: that drops the LINUX64
+ * 4 KiB pmap. Its cpu_tte is still a 4 KiB L1, so stage 210 must not copy indices 384..495 into this table.
+ */
+#if defined(CONFIG_ARM64_16K_PAGES)
+#define XNU_HOST_16K  1
+#define XNU_MAP_BLOCK (32ULL << 20)	/* L2 block */
+#define XNU_L2_SHIFT  25
+#define XNU_L2_PTRS   2048
+#define XNU_L1_SHIFT  36
+#define XNU_L1_PTRS   2048
+#else
+#define XNU_HOST_16K  0
+#define XNU_MAP_BLOCK (2ULL << 20)
+#define XNU_L2_SHIFT  21
+#define XNU_L2_PTRS   512
+#define XNU_L1_SHIFT  30
+#define XNU_L1_PTRS   512
+#endif
+#define XNU_L2_BYTES  (XNU_L2_PTRS * (unsigned)sizeof(unsigned long long))
+static unsigned char window_owned[XNU_L1_PTRS];
+#define XNU_L1_FIRST 384	/* 4 KiB XNU root: VM_MIN_KERNEL_ADDRESS 0xffffffe000000000 */
+#define XNU_L1_LAST 495		/* 4 KiB XNU root: VM_MAX_KERNEL_ADDRESS 0xfffffffbffffffff */
 static void *blob;
 /* A root RAM disk (firmware blob): placed in XNU's DRAM after the ADT, /chosen/memory-map RAMDisk, boot-arg rd=md0. */
 static char *ramdisk;
@@ -596,15 +620,24 @@ static long xnu_hook_body(unsigned long call, unsigned long a1, unsigned long a2
 		walk_log("xnu: XNU table walk for the Mach-O header", diag_va[1], tte);
 		walk_log("xnu: XNU table walk for boot args", diag_va[2], tte);
 		walk_log("xnu: XNU table walk for the cpu_tte page", a1, tte);
-		int n = 0, last = -1;
-		for (int i = XNU_L1_FIRST; i <= XNU_L1_LAST; i++) {
-			if (!(tte[i] & 1)) continue;
-			if (window_l1[i] && &window_l1[i] != window_slot) { logkv("xnu: L1 slot in use by Linux, refusing:", i); return 1; }
-			window_l1[i] = tte[i]; window_owned[i] = 1; n++; last = i;
+		if (XNU_HOST_16K) {
+			/*
+			 * cpu_tte[384..495] are 1 GiB slots of a 4 KiB L1. On this host those indices are different
+			 * 64 GiB windows, and the descriptors point at 4 KiB tables. The bootstrap map of L1[2046]
+			 * already covers the contiguous DRAM (the slot is 64 GiB), so it stays.
+			 */
+			logs("xnu: host granule is 16 KiB; XNU's 4 KiB L1 is not installed, bootstrap map stays");
+		} else {
+			int n = 0, last = -1;
+			for (int i = XNU_L1_FIRST; i <= XNU_L1_LAST; i++) {
+				if (!(tte[i] & 1)) continue;
+				if (window_l1[i] && &window_l1[i] != window_slot) { logkv("xnu: L1 slot in use by Linux, refusing:", i); return 1; }
+				window_l1[i] = tte[i]; window_owned[i] = 1; n++; last = i;
+			}
+			if (last >= 0) fki_window_set(&window_l1[last], tte[last]);	/* barrier + TLB flush */
+			logkv("xnu: XNU L1 entries installed", n);
 		}
-		if (last >= 0) fki_window_set(&window_l1[last], tte[last]);	/* barrier + TLB flush */
-		logkv("xnu: XNU L1 entries installed", n);
-		/* Touch XNU memory through XNU's own tables now (Linux context: a fault here is a readable oops). */
+		/* Touch the mapped window (XNU's tables on a 4 KiB host, the bootstrap map on a 16 KiB host). A fault here is a readable oops. */
 		logkv("xnu: probe text word", *(volatile unsigned int *)diag_va[0]);
 		logkv("xnu: probe Mach-O magic", *(volatile unsigned int *)diag_va[1]);
 		logkv("xnu: probe boot args Version", ((volatile struct boot_args_v2 *)diag_va[2])->Version);
@@ -1173,7 +1206,7 @@ static int run_m2a(void)
  * M2b: XNU at its own link address in the top foreign window, on physically contiguous memory with real
  * physical addresses, so that the page tables XNU builds can be walked by the hardware.
  */
-#define XNU_WINDOW_BASE (img.vmlow & ~0x1fffffULL)	/* 2 MiB aligned, at or below the image's vmlow */
+#define XNU_WINDOW_BASE (img.vmlow & ~(XNU_MAP_BLOCK - 1))	/* one block, at or below the image's vmlow */
 
 static int run_m2b(void)
 {
@@ -1185,32 +1218,38 @@ static int run_m2b(void)
 	if (err) { logkv("xnu: contiguous allocation failed, err", (u64_t)err); return err; }
 	logkv("xnu: contiguous DRAM at phys", img.region.pa);
 	logkv("xnu: contiguous DRAM size", img.region.size);
-	if (img.region.pa & 0x1fffff) { logs("xnu: region not 2 MiB aligned"); return -22; }
+	if (img.region.pa & (XNU_MAP_BLOCK - 1)) {
+		logs(XNU_HOST_16K ? "xnu: region not 32 MiB aligned" : "xnu: region not 2 MiB aligned");
+		return -22;
+	}
 
-	err = fki_contig_alloc(4096, &l2page);
+	err = fki_contig_alloc(XNU_L2_BYTES, &l2page);
 	if (err) return err;
 	unsigned long long *l2 = l2page.va;
-	unsigned first = (XNU_WINDOW_BASE >> 21) & 511;
+	unsigned first = (XNU_WINDOW_BASE >> XNU_L2_SHIFT) & (XNU_L2_PTRS - 1);
 	/*
-	 * One bootstrap L2 table: map what fits in the window's 1 GiB L1 slot. XNU only touches the image, the
-	 * boot data and its first bootstrap allocations before it hands us its own kernel L1 entries (stage 210),
-	 * which map all of its DRAM, so DRAM beyond the slot needs no bootstrap mapping.
+	 * One bootstrap L2 table, plugged into the link address's L1 slot (4 KiB host: 1 GiB; 16 KiB host: 64 GiB,
+	 * and the measured free slot is 2046). On a 4 KiB host the slot does not hold all of DRAM; XNU's own L1
+	 * entries replace this map at stage 210. On a 16 KiB host the slot holds it, and those 4 KiB entries are
+	 * not installed.
 	 */
 	u64_t boot_map = img.region.size;
-	if (boot_map > ((u64_t)(512 - first) << 21)) boot_map = (u64_t)(512 - first) << 21;
+	u64_t slot_room = (u64_t)(XNU_L2_PTRS - first) << XNU_L2_SHIFT;
+	if (boot_map > slot_room) boot_map = slot_room;
 	if (boot_map < image_off + image_size + 0x60000 + BOOT_EXTRA + (64ULL << 20)) {
 		logs("xnu: image and boot data do not fit in the bootstrap window"); return -22;
 	}
 	logkv("xnu: bootstrap window base", XNU_WINDOW_BASE);
 	logkv("xnu: bootstrap window bytes", boot_map);
-	for (u64_t o = 0; o < boot_map; o += 0x200000) {
-		/* 2 MiB block: normal WB (AttrIdx 0 in Linux's MAIR), inner shareable, AF, EL1 RWX, UXN */
-		l2[first + (o >> 21)] = (img.region.pa + o) | (1ULL << 54) | (1ULL << 10) | (3ULL << 8) | 1;
+	for (u64_t o = 0; o < boot_map; o += XNU_MAP_BLOCK) {
+		/* Block: normal WB (AttrIdx 0 in Linux's MAIR), inner shareable, AF, EL1 RWX, UXN.
+		 * 4 KiB granule: 2 MiB, OA in [47:21]. 16 KiB granule: 32 MiB, OA in [47:25]. The attribute bits sit outside both. */
+		l2[first + (o >> XNU_L2_SHIFT)] = (img.region.pa + o) | (1ULL << 54) | (1ULL << 10) | (3ULL << 8) | 1;
 	}
 	unsigned long long *l1; fki_u64 l1pa;
 	err = fki_window_l1(XNU_WINDOW_BASE, &l1, &l1pa);
 	if (err) { logs("xnu: no L1 table for the top window"); return err; }
-	unsigned idx = (XNU_WINDOW_BASE >> 30) & 511;
+	unsigned idx = (XNU_WINDOW_BASE >> XNU_L1_SHIFT) & (XNU_L1_PTRS - 1);
 	logkv("xnu: top window L1 table at phys", l1pa);
 	logkv("xnu: L1 slot", idx);
 	if (l1[idx]) { logkv("xnu: L1 slot already used by Linux:", l1[idx]); return -16; }
@@ -1291,7 +1330,7 @@ static void __exit xnu_exit(void)
 {
 	if (window_l1) {
 		int last = -1;
-		for (int i = 0; i < 512; i++) if (window_owned[i]) { window_l1[i] = 0; last = i; }
+		for (int i = 0; i < XNU_L1_PTRS; i++) if (window_owned[i]) { window_l1[i] = 0; last = i; }
 		if (last >= 0) fki_window_set(&window_l1[last], 0);
 	}
 	if (mode == 3) {

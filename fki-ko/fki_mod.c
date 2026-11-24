@@ -76,6 +76,8 @@ static struct cma **p_cma_area;	/* the default CMA area (cma= on the command lin
 static struct page *(*p_cma_alloc)(struct cma *, unsigned long, unsigned int, bool);	/* not exported on every kernel */
 static bool (*p_cma_release)(struct cma *, const struct page *, unsigned long);
 static set_memory_fn p_set_memory_x, p_set_memory_nx;
+static const char *p_alloc_name;
+static int fki_have_lookup;
 static unsigned long p_stext, p_end;
 static u64 *p_kimage_voffset;
 static int (*p_efi_mem_type)(unsigned long);	/* the firmware's memory map: is the carve-out RAM at all */
@@ -92,11 +94,15 @@ static int fki_resolve(void)
 			return -ENOENT;
 		lookup = (void *)kp.addr;
 		unregister_kprobe(&kp);
+		fki_have_lookup = 1;
 	}
 	p_set_memory_x = (set_memory_fn)lookup("set_memory_x");
 	p_alloc_contig = (alloc_contig_fn)lookup("alloc_contig_pages_noprof");
-	if (!p_alloc_contig)
+	p_alloc_name = "alloc_contig_pages_noprof";
+	if (!p_alloc_contig) {
 		p_alloc_contig = (alloc_contig_fn)lookup("alloc_contig_pages");
+		p_alloc_name = "alloc_contig_pages";
+	}
 	p_free_contig = (free_contig_fn)lookup("free_contig_range");
 	p_cma_area = (struct cma **)lookup("dma_contiguous_default_area");
 	p_cma_alloc = (void *)lookup("cma_alloc");
@@ -956,10 +962,100 @@ static void fki_free_alt_stacks(void)
 	}
 }
 
+/* insmod fki.ko survey=1: which fki_resolve() symbols this kernel has, and which L0[1] L1 slots are empty.
+ * L0[1] is the high TTBR1 half (VA 0xffff800000000000, 2048 slots of 64 GiB on 16 KiB / 48-bit). */
+static bool survey;
+module_param(survey, bool, 0444);
+MODULE_PARM_DESC(survey, "log fki_resolve symbols and free L1 slots under TTBR1 L0[1]");
+
+static void fki_log_sym(const char *name, const void *p)
+{
+	if (p)
+		pr_info("fki: symbol %s ok\n", name);
+	else
+		pr_warn("fki: symbol %s MISSING\n", name);
+}
+
+static void fki_survey_l1(void)
+{
+	unsigned long long *l1;
+	fki_u64 l1pa;
+	unsigned int i, run = 0, prev = 0;
+	int err = fki_window_l1(0xffff800000000000UL, &l1, &l1pa);
+	static const char *const kind_name[] = { "free", "block", "other", "table" };
+
+	if (err) {
+		pr_err("fki: L0[1] has no L1 table (%d)\n", err);
+		return;
+	}
+	pr_info("fki: L0[1] L1 table at phys %#llx\n", l1pa);
+	for (i = 0; i <= 2048; i++) {
+		unsigned int kind = 4;
+		u64 ent = 0;
+
+		if (i < 2048) {
+			ent = READ_ONCE(l1[i]);
+			if (!ent)
+				kind = 0;
+			else if ((ent & 3) == 1)
+				kind = 1;
+			else if ((ent & 3) == 3)
+				kind = 3;
+			else
+				kind = 2;
+		}
+		if (i == 0) {
+			prev = kind;
+			continue;
+		}
+		if (kind == prev)
+			continue;
+		pr_info("fki: L1 %s slots %u..%u va %#lx-%#lx\n", kind_name[prev], run, i - 1,
+			0xffff800000000000UL + ((unsigned long)run << 36),
+			0xffff800000000000UL + ((unsigned long)i << 36));
+		prev = kind;
+		run = i;
+	}
+	{
+		unsigned long va = 0xffffffe000000000UL;
+		unsigned int idx16 = (va >> 36) & 2047;
+		u64 ent = READ_ONCE(l1[idx16]);
+
+		pr_info("fki: va %#lx is L1[%u] desc %#llx (%s); 4KiB-style index (>>30 & 511) would be %lu\n",
+			va, idx16, ent, ent ? "used" : "free", (va >> 30) & 511);
+	}
+}
+
+static void fki_survey(void)
+{
+	int err = fki_resolve();
+
+	pr_info("fki: fki_resolve %s\n", err ? "FAILED" : "ok");
+	fki_log_sym("kallsyms_lookup_name", fki_have_lookup ? (const void *)1 : NULL);
+	if (p_cma_area)
+		pr_info("fki: dma_contiguous_default_area %s\n", *p_cma_area ? "non-NULL" : "NULL");
+	fki_log_sym("set_memory_x", p_set_memory_x);
+	fki_log_sym(p_alloc_name ? p_alloc_name : "alloc_contig_pages", p_alloc_contig);
+	fki_log_sym("free_contig_range", p_free_contig);
+	fki_log_sym("dma_contiguous_default_area", p_cma_area);
+	fki_log_sym("cma_alloc", p_cma_alloc);
+	fki_log_sym("cma_release", p_cma_release);
+	fki_log_sym("set_memory_nx", p_set_memory_nx);
+	fki_log_sym("_stext", (void *)p_stext);
+	fki_log_sym("_end", (void *)p_end);
+	fki_log_sym("kimage_voffset", p_kimage_voffset);
+	fki_log_sym("efi_mem_type", p_efi_mem_type);
+	if (!err)
+		fki_survey_l1();
+}
+
 static int __init fki_init(void)
 {
 	struct net_device *dev;
 	int err, cpu;
+
+	if (survey)
+		fki_survey();
 
 	for_each_possible_cpu(cpu) {
 		struct page *pg = alloc_pages(GFP_KERNEL, FKI_ALT_STACK_ORDER);
